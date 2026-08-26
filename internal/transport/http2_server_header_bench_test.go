@@ -19,20 +19,23 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"testing"
+	"time"
 
-	"golang.org/x/net/http2/hpack"
-
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
-// BenchmarkAppendHeaderFieldsFromMD measures the slice re-allocation overhead
-// of appendHeaderFieldsFromMD when the initial slice capacity is too small
-// (old behavior) versus pre-sized to the exact metadata count (new behavior).
-func BenchmarkAppendHeaderFieldsFromMD(b *testing.B) {
+// BenchmarkServerHeaderFields benchmarks the real writeHeaderLocked and
+// writeStatus code paths with varying amounts of metadata, mirroring the
+// approach used in BenchmarkCreateHeaderFields for the client side.
+func BenchmarkServerHeaderFields(b *testing.B) {
 	for _, mdCount := range []int{0, 4, 12, 48} {
 		b.Run(fmt.Sprintf("mdCount=%d", mdCount), func(b *testing.B) {
+			// Build the metadata once for all iterations in this sub-benchmark.
 			md := make(metadata.MD, mdCount)
 			for i := 0; i < mdCount; i++ {
 				md[fmt.Sprintf("header-%d", i)] = []string{
@@ -41,21 +44,53 @@ func BenchmarkAppendHeaderFieldsFromMD(b *testing.B) {
 				}
 			}
 
-			b.Run("unsized", func(b *testing.B) {
+			// Set up a minimal http2Server with just enough to exercise the
+			// real writeHeaderLocked and writeStatus methods.
+			done := make(chan struct{})
+			t := &http2Server{
+				controlBuf:            newControlBuffer(done),
+				setResetPingStrikes:   func() {},
+				maxSendHeaderListSize: nil, // no limit — skip header list size check
+			}
+
+			b.Run("writeHeaderLocked", func(b *testing.B) {
 				b.ReportAllocs()
 				for b.Loop() {
-					headerFields := make([]hpack.HeaderField, 0, 2)
-					headerFields = appendHeaderFieldsFromMD(headerFields, md)
-					_ = headerFields
+					ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+					s := &ServerStream{
+						Stream: Stream{
+							id:  1,
+							fc:  inFlow{limit: 65536},
+							ctx: ctx,
+						},
+						st:     t,
+						header: md,
+					}
+					s.cancel = cancel
+					if err := t.writeHeaderLocked(s); err != nil {
+						b.Fatal(err)
+					}
 				}
 			})
 
-			b.Run("sized", func(b *testing.B) {
+			b.Run("writeStatus", func(b *testing.B) {
 				b.ReportAllocs()
+				st := status.New(codes.OK, "OK")
 				for b.Loop() {
-					headerFields := make([]hpack.HeaderField, 0, headerFieldsCountFromMD(md))
-					headerFields = appendHeaderFieldsFromMD(headerFields, md)
-					_ = headerFields
+					ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+					s := &ServerStream{
+						Stream: Stream{
+							id:  1,
+							fc:  inFlow{limit: 65536},
+							ctx: ctx,
+						},
+						st:     t,
+						header: md,
+					}
+					s.cancel = cancel
+					if err := t.writeStatus(s, st); err != nil {
+						b.Fatal(err)
+					}
 				}
 			})
 		})
