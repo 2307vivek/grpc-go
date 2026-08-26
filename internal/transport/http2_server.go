@@ -1105,6 +1105,16 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 		return nil
 	}
 
+	// Hoist the status proto check so we can (a) delete the user's
+	// grpc-status-details-bin from the trailer before counting, avoiding
+	// an over-count, and (b) conditionally reserve one extra slot only
+	// when details are actually present.
+	p := istatus.RawStatusProto(st)
+	hasStatusDetails := len(p.GetDetails()) > 0
+	if hasStatusDetails {
+		delete(s.trailer, grpcStatusDetailsBinHeader)
+	}
+
 	// Count the metadata header fields as well so the slice is not reallocated
 	// while they are appended below.
 	headersAlreadySent := s.updateHeaderSent()
@@ -1114,8 +1124,10 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 		// Trailer only response gets :status and content-type as well.
 		headerFieldCount += 2
 	}
-	// +1 for optional grpc-status-details-bin
-	headerFields := make([]hpack.HeaderField, 0, headerFieldCount+1)
+	if hasStatusDetails {
+		headerFieldCount++ // for grpc-status-details-bin
+	}
+	headerFields := make([]hpack.HeaderField, 0, headerFieldCount)
 	if !headersAlreadySent { // No headers have been sent.
 		if len(s.header) > 0 { // Send a separate header frame.
 			if err := t.writeHeaderLocked(s); err != nil {
@@ -1129,10 +1141,7 @@ func (t *http2Server) writeStatus(s *ServerStream, st *status.Status) error {
 	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-status", Value: strconv.Itoa(int(st.Code()))})
 	headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-message", Value: encodeGrpcMessage(st.Message())})
 
-	if p := istatus.RawStatusProto(st); len(p.GetDetails()) > 0 {
-		// Do not use the user's grpc-status-details-bin (if present) if we are
-		// even attempting to set our own.
-		delete(s.trailer, grpcStatusDetailsBinHeader)
+	if hasStatusDetails {
 		stBytes, err := proto.Marshal(p)
 		if err != nil {
 			// TODO: return error instead, when callers are able to handle it.
