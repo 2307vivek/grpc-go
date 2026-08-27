@@ -34,7 +34,8 @@ import (
 // approach used in BenchmarkCreateHeaderFields for the client side.
 func BenchmarkServerHeaderFields(b *testing.B) {
 	for _, mdCount := range []int{0, 4, 12, 48} {
-		b.Run(fmt.Sprintf("mdCount=%d", mdCount), func(b *testing.B) {
+		b.Run(fmt.Sprintf("writeHeaderLocked_mdcoount=%d", mdCount), func(b *testing.B) {
+
 			// Build the metadata once for all iterations in this sub-benchmark.
 			md := make(metadata.MD, mdCount)
 			for i := 0; i < mdCount; i++ {
@@ -53,46 +54,79 @@ func BenchmarkServerHeaderFields(b *testing.B) {
 				maxSendHeaderListSize: nil, // no limit — skip header list size check
 			}
 
-			b.Run("writeHeaderLocked", func(b *testing.B) {
-				b.ReportAllocs()
-				for b.Loop() {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-					s := &ServerStream{
-						Stream: Stream{
-							id:  1,
-							fc:  inFlow{limit: 65536},
-							ctx: ctx,
-						},
-						st:     t,
-						header: md,
-					}
-					s.cancel = cancel
-					if err := t.writeHeaderLocked(s); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
+			// Create context and stream once, reuse in loop to avoid allocations.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
 
-			b.Run("writeStatus", func(b *testing.B) {
-				b.ReportAllocs()
-				st := status.New(codes.OK, "OK")
-				for b.Loop() {
-					ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-					s := &ServerStream{
-						Stream: Stream{
-							id:  1,
-							fc:  inFlow{limit: 65536},
-							ctx: ctx,
-						},
-						st:     t,
-						header: md,
-					}
-					s.cancel = cancel
-					if err := t.writeStatus(s, st); err != nil {
-						b.Fatal(err)
-					}
+			s := &ServerStream{
+				Stream: Stream{
+					id:             1,
+					fc:             inFlow{limit: 65536},
+					ctx:            ctx,
+					contentSubtype: "proto",
+				},
+				st:     t,
+				header: md,
+			}
+			s.cancel = cancel
+
+			b.ReportAllocs()
+			for b.Loop() {
+				// Reset stream state for each iteration.
+				s.state = streamActive
+				s.headerSent.Store(false)
+				if err := t.writeHeaderLocked(s); err != nil {
+					b.Fatal(err)
 				}
-			})
+			}
+		})
+
+		b.Run(fmt.Sprintf("writeSatus_mdcoount=%d", mdCount), func(b *testing.B) {
+
+			// Build the metadata once for all iterations in this sub-benchmark.
+			md := make(metadata.MD, mdCount)
+			for i := 0; i < mdCount; i++ {
+				md[fmt.Sprintf("header-%d", i)] = []string{
+					fmt.Sprintf("value-%d-a", i),
+					fmt.Sprintf("value-%d-b", i),
+				}
+			}
+
+			// Set up a minimal http2Server with just enough to exercise the
+			// real writeHeaderLocked and writeStatus methods.
+			done := make(chan struct{})
+			t := &http2Server{
+				controlBuf:            newControlBuffer(done),
+				setResetPingStrikes:   func() {},
+				maxSendHeaderListSize: nil, // no limit — skip header list size check
+			}
+
+			// Create context and stream once, reuse in loop to avoid allocations.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+
+			s := &ServerStream{
+				Stream: Stream{
+					id:             1,
+					fc:             inFlow{limit: 65536},
+					ctx:            ctx,
+					contentSubtype: "proto",
+				},
+				st:     t,
+				header: md,
+			}
+			s.cancel = cancel
+			b.ReportAllocs()
+			st := status.New(codes.OK, "OK")
+			for b.Loop() {
+				// Reset stream state for each iteration.
+				s.state = streamActive
+				s.headerSent.Store(false)
+				s.trailer = nil
+				if err := t.writeStatus(s, st); err != nil {
+					b.Fatal(err)
+				}
+			}
 		})
 	}
 }
