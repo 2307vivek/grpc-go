@@ -29,104 +29,95 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// BenchmarkServerHeaderFields benchmarks the real writeHeaderLocked and
-// writeStatus code paths with varying amounts of metadata, mirroring the
-// approach used in BenchmarkCreateHeaderFields for the client side.
 func BenchmarkServerHeaderFields(b *testing.B) {
 	for _, mdCount := range []int{0, 4, 12, 48} {
-		b.Run(fmt.Sprintf("writeHeaderLocked_mdcoount=%d", mdCount), func(b *testing.B) {
+		b.Run(fmt.Sprintf("writeHeaderLocked_mdCount=%d", mdCount), func(b *testing.B) {
 
-			// Build the metadata once for all iterations in this sub-benchmark.
-			md := make(metadata.MD, mdCount)
-			for i := 0; i < mdCount; i++ {
-				md[fmt.Sprintf("header-%d", i)] = []string{
-					fmt.Sprintf("value-%d-a", i),
-					fmt.Sprintf("value-%d-b", i),
-				}
-			}
-
-			// Set up a minimal http2Server with just enough to exercise the
-			// real writeHeaderLocked and writeStatus methods.
-			done := make(chan struct{})
-			t := &http2Server{
-				controlBuf:            newControlBuffer(done),
-				setResetPingStrikes:   func() {},
-				maxSendHeaderListSize: nil, // no limit — skip header list size check
-			}
-
-			// Create context and stream once, reuse in loop to avoid allocations.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-			defer cancel()
-
-			s := &ServerStream{
-				Stream: Stream{
-					id:             1,
-					fc:             inFlow{limit: 65536},
-					ctx:            ctx,
-					contentSubtype: "proto",
-				},
-				st:     t,
-				header: md,
-			}
-			s.cancel = cancel
+			t, s, cleanup := newBenchStream(b, mdCount, 0)
+			defer cleanup()
 
 			b.ReportAllocs()
 			for b.Loop() {
-				// Reset stream state for each iteration.
 				s.state = streamActive
-				s.headerSent.Store(false)
 				if err := t.writeHeaderLocked(s); err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 
-		b.Run(fmt.Sprintf("writeSatus_mdcoount=%d", mdCount), func(b *testing.B) {
+		st := status.New(codes.OK, "OK")
 
-			// Build the metadata once for all iterations in this sub-benchmark.
-			md := make(metadata.MD, mdCount)
-			for i := 0; i < mdCount; i++ {
-				md[fmt.Sprintf("header-%d", i)] = []string{
-					fmt.Sprintf("value-%d-a", i),
-					fmt.Sprintf("value-%d-b", i),
-				}
-			}
+		b.Run(fmt.Sprintf("writeStatus_trailersOnly_mdCount=%d", mdCount), func(b *testing.B) {
+			t, s, cleanup := newBenchStream(b, 0, mdCount)
+			defer cleanup()
 
-			// Set up a minimal http2Server with just enough to exercise the
-			// real writeHeaderLocked and writeStatus methods.
-			done := make(chan struct{})
-			t := &http2Server{
-				controlBuf:            newControlBuffer(done),
-				setResetPingStrikes:   func() {},
-				maxSendHeaderListSize: nil, // no limit — skip header list size check
-			}
-
-			// Create context and stream once, reuse in loop to avoid allocations.
-			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-			defer cancel()
-
-			s := &ServerStream{
-				Stream: Stream{
-					id:             1,
-					fc:             inFlow{limit: 65536},
-					ctx:            ctx,
-					contentSubtype: "proto",
-				},
-				st:     t,
-				header: md,
-			}
-			s.cancel = cancel
 			b.ReportAllocs()
-			st := status.New(codes.OK, "OK")
 			for b.Loop() {
-				// Reset stream state for each iteration.
 				s.state = streamActive
 				s.headerSent.Store(false)
-				s.trailer = nil
 				if err := t.writeStatus(s, st); err != nil {
 					b.Fatal(err)
 				}
 			}
 		})
 	}
+}
+
+func makeMD(prefix string, count int) metadata.MD {
+	md := make(metadata.MD, count)
+	for i := 0; i < count; i++ {
+		md[fmt.Sprintf("%s-%d", prefix, i)] = []string{
+			fmt.Sprintf("value-%d-a", i),
+			fmt.Sprintf("value-%d-b", i),
+		}
+	}
+	return md
+}
+
+func newBenchStream(b *testing.B, headerCount, trailerCount int) (*http2Server, *ServerStream, func()) {
+	b.Helper()
+
+	done := make(chan struct{})
+	t := &http2Server{
+		controlBuf:            newControlBuffer(done),
+		setResetPingStrikes:   func() {},
+		maxSendHeaderListSize: nil,
+	}
+
+	// Drain the control buffer continuously, the way loopyWriter would in a
+	// real server. Without this, every headerFrame pushed by
+	// writeHeaderLocked/writeStatus stays queued forever, so the benchmark
+	// leaks memory and its timings are dominated by growing GC pressure
+	// instead of the cost of the functions under test.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		for {
+			if _, err := t.controlBuf.get(true); err != nil {
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	s := &ServerStream{
+		Stream: Stream{
+			id:             1,
+			fc:             inFlow{limit: 65536},
+			ctx:            ctx,
+			contentSubtype: "proto",
+		},
+		st:     t,
+		header: makeMD("header", headerCount),
+	}
+
+	s.trailer = makeMD("trailer", trailerCount)
+	s.cancel = cancel
+
+	cleanup := func() {
+		cancel()
+		close(done) // unblocks controlBuf.get so the drain goroutine exits
+		<-drainDone
+	}
+	return t, s, cleanup
 }
